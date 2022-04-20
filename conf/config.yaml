@@ -1,0 +1,11 @@
+seed: 0
+num_batches: 75
+batch_size: 16
+learning_rate: 0.001
+epochs: 100
+
+layers: 
+  input_size: 1
+  layer1_size: 128
+  layer2_size: 128
+  output_size: 1 
