@@ -5,5 +5,5 @@ Multiple implementations of a DQN.
 
 Playing catch with a DQN
 ```
-python play_catch.py
+python catch.py
 ```
