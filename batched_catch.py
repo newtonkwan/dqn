@@ -36,6 +36,32 @@ import numpy as np
 import optax
 import rlax
 import matplotlib.pyplot as plt
+import buffers
+
+def global_setup(args):
+    '''Set up global variables.'''
+    if args.wandb.log:
+        wandb.init(
+            entity=str(args.wandb.entity),
+            project=str(args.wandb.project),
+            group=str(args.wandb.group),
+            name=str(args.wandb.name),
+            config=vars(args),
+        )
+def env_setup(num_envs):
+    '''Set up env variables.'''
+    train_envs = [catch.Catch(seed=i) for i in range(num_envs)]
+    eval_env = catch.Catch(seed=num_envs)
+    return train_envs, eval_env
+
+def next_timesteps(envs, actions):
+    '''Take timesteps in each environment'''
+    new_timesteps = []
+    for env, action in zip(envs, actions):
+      new_timesteps.append(env.step(action.squeeze()))
+    #new_timesteps = [env.step(action) for env, action in zip(envs, actions)]
+
+    return new_timesteps
 
 class TrainingState(NamedTuple):
   """Holds the agent's training state."""
@@ -71,11 +97,13 @@ class DQN(base.Agent):
              transitions: Sequence[jnp.ndarray]) -> jnp.ndarray:
       """Computes the standard TD(0) Q-learning loss on batch of transitions."""
       # observation, action, reward, discount, observation
-      o_tm1, a_tm1, r_t, d_t, o_t = transitions
+      o_tm1, a_tm1, r_t, o_t = transitions
       q_tm1 = network.apply(params, o_tm1)
       q_t = network.apply(target_params, o_t)
       batch_q_learning = jax.vmap(rlax.q_learning)
-      td_error = batch_q_learning(q_tm1, a_tm1, r_t, discount * d_t, q_t)
+      a_tm1 = a_tm1.squeeze()
+      r_t = r_t.squeeze()
+      td_error = batch_q_learning(q_tm1, a_tm1, r_t, discount * jnp.ones_like(r_t), q_t)
       return jnp.mean(td_error**2)
 
     # Define update function.
@@ -107,7 +135,10 @@ class DQN(base.Agent):
         step=0)
     self._sgd_step = sgd_step
     self._forward = jax.jit(network.apply)
-    self._replay = replay.Replay(capacity=replay_capacity)
+    self._replay = buffers.ReplayBuffer(
+      state_dim = obs_spec.shape, 
+      max_size = replay_capacity
+      )
 
     # Store hyperparameters.
     self._num_actions = action_spec.num_values
@@ -118,40 +149,50 @@ class DQN(base.Agent):
     self._total_steps = 0
     self._min_replay_size = min_replay_size
 
-  def select_action(self, timestep: dm_env.TimeStep) -> base.Action:
-    """Selects actions according to an epsilon-greedy policy."""
-    if np.random.rand() < self._epsilon:
-      return np.random.randint(self._num_actions)
+  def select_action(self, key, timesteps: list) -> jnp.array:
+    """Selects batched actions according to an epsilon-greedy policy."""
+    key, subkey = jax.random.split(key)
+    num_envs = len(timesteps)
+    # mask = np.random.rand(num_envs, 1) < self._epsilon
+    mask = jax.random.uniform(key, shape = (num_envs, 1)) < self._epsilon
+    observations = jnp.stack([_t.observation for _t in timesteps])
+    q_values = self._forward(self._state.params, observations)
+    actions = jnp.where(
+        mask==True, 
+        # x = np.random.randint(self._num_actions), 
+        x = jax.random.randint(subkey, shape=(),minval=0, maxval = self._num_actions, dtype=int), 
+        y = jnp.argmax(q_values, axis=1, keepdims=True)) # keepdims=True preserves the correct shape 
+    assert actions.shape == (num_envs, 1)
+    return actions
 
-    # Greedy policy, breaking ties uniformly at random.
-    observation = timestep.observation[None, ...]
-    q_values = self._forward(self._state.params, observation)
-    action = np.random.choice(np.flatnonzero(q_values == q_values.max()))
-    return int(action)
 
-  def select_action_eval(self, timestep: dm_env.TimeStep) -> base.Action:
+  def select_action_eval(self, key, timestep: dm_env.TimeStep) -> base.Action:
     """Selects actions according to a greedy policy."""
     # Greedy policy, breaking ties uniformly at random.
     observation = timestep.observation[None, ...]
     q_values = self._forward(self._state.target_params, observation)
-    action = np.random.choice(np.flatnonzero(q_values == q_values.max()))
+    # action = np.random.choice(np.flatnonzero(q_values == q_values.max()))
+    action = jax.random.choice(key, np.flatnonzero(q_values == q_values.max())) # np.random.choice(np.flatnonzero(q_values == q_values.max()))
     return int(action)
 
   def update(
       self,
-      timestep: dm_env.TimeStep,
-      action: base.Action,
-      new_timestep: dm_env.TimeStep,
+      key, 
+      timesteps: list,
+      actions: jnp.array, 
+      new_timesteps: list,
   ):
     """Adds transition to replay and periodically does SGD."""
     # Add this transition to replay.
-    self._replay.add([
-        timestep.observation,
-        action,
-        new_timestep.reward,
-        new_timestep.discount,
-        new_timestep.observation,
-    ])
+    observations = jnp.stack([_t.observation for _t in timesteps])
+    new_observations = jnp.stack([_t.observation for _t in new_timesteps])
+    rewards = jnp.stack([_t.reward for _t in new_timesteps])
+    self._replay.add_batch(
+        state = observations,
+        action = actions,
+        reward = rewards, 
+        next_state = new_observations, 
+        )
 
     self._total_steps += 1
     if self._total_steps % self._sgd_period != 0:
@@ -161,16 +202,17 @@ class DQN(base.Agent):
       return
 
     # Do a batch of SGD.
-    transitions = self._replay.sample(self._batch_size)
+    transitions = self._replay.sample(rng = key, batch_size = self._batch_size)
     self._state = self._sgd_step(self._state, transitions)
 
     # Periodically update target parameters.
     if self._state.step % self._target_update_period == 0:
       self._state = self._state._replace(target_params=self._state.params)
 
-def default_agent(obs_spec: specs.Array,
-                  action_spec: specs.DiscreteArray,
-                  seed: int = 0) -> base.Agent:
+def default_agent(args, 
+                  obs_spec: specs.Array,
+                  action_spec: specs.DiscreteArray
+                  ) -> base.Agent:
   """Initialize a DQN agent with default parameters."""
 
   def network(inputs: jnp.ndarray) -> jnp.ndarray:
@@ -183,83 +225,90 @@ def default_agent(obs_spec: specs.Array,
       obs_spec=obs_spec,
       action_spec=action_spec,
       network=network,
-      optimizer=optax.adam(1e-3),
-      batch_size=2,
-      discount=0.99,
-      replay_capacity=10000,
-      min_replay_size=100,
-      sgd_period=1,
-      target_update_period=4,
-      epsilon=0.05,
-      rng=hk.PRNGSequence(seed),
+      optimizer=optax.adam(args.learning_rate),
+      batch_size=args.batch_size,
+      discount=args.discount,
+      replay_capacity=args.replay_capacity,
+      min_replay_size=args.min_replay_size,
+      sgd_period=args.sgd_period,
+      target_update_period=args.target_update_period,
+      epsilon=args.epsilon,
+      rng=hk.PRNGSequence(args.seed),
   )
 def moving_average(x, w):
     return np.convolve(x, np.ones(w), 'valid') / w
 
 @hydra.main(config_path="conf", config_name="config")
-def main(args): 
-    # TODO: Make this all configurable using Hydra after you have gotten it working
-    wandb.init(
-    entity=str(args.wandb.entity),
-    project=str(args.wandb.project),
-    group=str(args.wandb.group),
-    name=str(args.wandb.name),
-    config=vars(args))
-    # Experiment configs.
-    train_episodes = 1000
-    eval_episodes = 200
+def main(args):
+    # setup WandB
+    global_setup(args)
+    key = jax.random.PRNGKey(args.seed)
 
-    # Create environment.
-    env = catch.Catch(seed=42)
+    # Create train and test environments
+    train_envs, eval_env = env_setup(
+      num_envs = args.num_envs
+      )
 
     # Initiliaze the agent
     agent = default_agent(
-      obs_spec = env.observation_spec(), 
-      action_spec = env.action_spec(), 
-      seed = 0)
+      args, 
+      obs_spec = eval_env.observation_spec(), 
+      action_spec = eval_env.action_spec()
+      )
 
-    print(f"Training agent for {train_episodes} episodes...")
+    print(f"Training agent for {args.train_episodes} episodes with {args.num_envs} environments ...")
     all_episode_returns = []
-    # Timestep: (step_type, reward, discount, observation)
-    for _ in range(train_episodes):
+    for episode in range(args.train_episodes):
         # Run an episode.
         episode_return = 0. 
-        timestep = env.reset()
-        #print(all_episode_returns)
-        while not timestep.last():
-            # Generate an action from the agent's policy.
-            action = agent.select_action(timestep)
 
-            # Step the environment.
-            new_timestep = env.step(action)
+        # Timestep: (step_type, reward, discount, observation)
+        # Create a list of initial timesteps for each environment 
+        timesteps = [env.reset() for env in train_envs]
 
-            # Tell the agent about what just happened.
-            agent.update(timestep, action, new_timestep)
+        # check if the episode in the first environment has terminated 
+        # all of the episodes end after 10 steps, so this is okay. 
+        while not timesteps[0].last():
+            # Actions: 0, 1, 2 = (-1, 0, 1) = (go left, stay, go right)
+            # Select actions from the agent's policy for each environment 
+            # Expected shape: np.array (num_envs, 1)
+            key, subkey, subsubkey = jax.random.split(key, num = 3)
+            actions = agent.select_action(subkey, timesteps)
 
-            # Book-keeping.
-            episode_return += new_timestep.reward 
-            timestep = new_timestep
+            # Take steps sequentially for each environment 
+            new_timesteps = next_timesteps(train_envs, actions)
+
+            # Tell the agent what just happened     
+            agent.update(subsubkey, timesteps, actions, new_timesteps)
+
+            # episode_returns += np.array([new_timestep.reward for new_timestep in new_timesteps])
+            episode_return += np.mean(np.array([_t.reward for _t in new_timesteps]))
+            timesteps = new_timesteps
+        
         all_episode_returns.append(episode_return)
-        smoothed_returns = moving_average(all_episode_returns, 30)
-        wandb.log({"train": float(smoothed_returns[-1])})
-        if _ % 100 == 0:
-            print(f"Episode: {_+1} with return {episode_return}")
+        smoothed_return = moving_average(all_episode_returns, 20)
+        if args.wandb.log: 
+            wandb.log({"train": float(smoothed_return[-1])})
+        if episode % 5 == 0:
+            print(f"Episode: {episode} with smoothed return: {episode_return}")
 
     # Evaluate the agent using the target network and greedy-policy
-    print(f"Evaluating agent for {eval_episodes} episodes...")
+    print(f"Evaluating agent for {args.eval_episodes} episodes...")
     all_episode_returns = []
     # Timestep: (step_type, reward, discount, observation)
-    for _ in range(eval_episodes):
+    for _ in range(args.eval_episodes):
         # Run an episode.
         episode_return = 0. 
-        timestep = env.reset()
+        timestep = eval_env.reset()
         #print(all_episode_returns)
         while not timestep.last():
+            key, subkey = jax.random.split(key)
+
             # Generate an action from the agent's policy.
-            action = agent.select_action_eval(timestep)
+            action = agent.select_action_eval(subkey, timestep)
 
             # Step the environment.
-            new_timestep = env.step(action)
+            new_timestep = eval_env.step(action)
 
             # Comment out during evaluation
             # Tell the agent about what just happened.
@@ -269,10 +318,11 @@ def main(args):
             episode_return += new_timestep.reward 
             timestep = new_timestep
         all_episode_returns.append(episode_return)
-        smoothed_returns = moving_average(all_episode_returns, 30)
-        wandb.log({"evaluation": float(smoothed_returns[-1])})
-        if _ % 100 == 0:
-            print(f"Episode: {_+1} with return {episode_return}")
+        smoothed_returns = moving_average(all_episode_returns, 10)
+        if args.wandb.log: 
+          wandb.log({"evaluation": float(smoothed_returns[-1])})
+        if _ % 20 == 0:
+            print(f"Episode: {_} with smoothed return {episode_return}")
 
 if __name__ == "__main__":
     main() 
